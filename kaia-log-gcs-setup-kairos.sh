@@ -73,6 +73,8 @@ get_kcnd_log_file() {
 # ── Install hourly GCS upload script ─────────────────────────────────────────
 install_upload_script() {
     local log_file="$1" instance="$2"
+    local openssl_bin
+    openssl_bin=$(command -v openssl 2>/dev/null || echo /usr/bin/openssl)
 
     cat > "$UPLOAD_SCRIPT" << PYEOF
 #!/usr/bin/env python3
@@ -89,6 +91,7 @@ HOSTNAME = "${instance}"
 BUCKET   = "${GCS_BUCKET}"
 KEY_FILE = "${CREDS_FILE}"
 LOG_FILE = "${log_file}"
+OPENSSL  = "${openssl_bin}"
 
 def get_access_token():
     with open(KEY_FILE) as f:
@@ -110,7 +113,7 @@ def get_access_token():
         tmp.flush()
         tmp.close()
         result = subprocess.run(
-            ["openssl", "dgst", "-sha256", "-sign", tmp.name],
+            [OPENSSL, "dgst", "-sha256", "-sign", tmp.name],
             input=signing_input,
             stdout=subprocess.PIPE, stderr=subprocess.PIPE
         )
