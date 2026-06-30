@@ -131,8 +131,6 @@ get_kcnd_log_file() {
 # ── Install hourly GCS upload script ─────────────────────────────────────────
 install_upload_script() {
     local log_file="$1" instance="$2"
-    local openssl_bin
-    openssl_bin=$(command -v openssl 2>/dev/null || echo /usr/bin/openssl)
 
     cat > "$UPLOAD_SCRIPT" << PYEOF
 #!/usr/bin/env python3
@@ -149,7 +147,7 @@ HOSTNAME = "${instance}"
 BUCKET   = "${GCS_BUCKET}"
 KEY_FILE = "${CREDS_FILE}"
 LOG_FILE = "${log_file}"
-OPENSSL  = "${openssl_bin}"
+OPENSSL  = shutil.which("openssl") or "/usr/bin/openssl"
 
 def get_access_token():
     with open(KEY_FILE) as f:
@@ -287,6 +285,21 @@ main() {
     echo
 
     [ "$(id -u)" -eq 0 ] || die "Must be run as root: sudo $0"
+
+    # Ensure openssl is available (needed for JWT signing)
+    if ! command -v openssl >/dev/null 2>&1; then
+        info "openssl not found, installing..."
+        if command -v dnf >/dev/null 2>&1; then
+            dnf install -y openssl
+        elif command -v yum >/dev/null 2>&1; then
+            yum install -y openssl
+        elif command -v apt-get >/dev/null 2>&1; then
+            apt-get install -y -q openssl
+        else
+            die "openssl not found. Install it manually: yum install openssl"
+        fi
+    fi
+    info "openssl: $(command -v openssl)"
 
     download_credentials
 
