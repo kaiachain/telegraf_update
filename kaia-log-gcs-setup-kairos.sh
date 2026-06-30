@@ -165,9 +165,10 @@ PYEOF
 
 # ── Add hourly cron job ───────────────────────────────────────────────────────
 install_cron() {
+    local upload_log="$1"
     cat > "$CRON_FILE" << EOF
 # Upload previous hour's kcnd log to GCS
-0 * * * * root ${UPLOAD_SCRIPT} >> /var/log/kaia-gcs-upload.log 2>&1
+0 * * * * root ${UPLOAD_SCRIPT} >> ${upload_log} 2>&1
 EOF
     info "Cron job installed: $CRON_FILE"
 }
@@ -226,15 +227,18 @@ main() {
     echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
     echo
 
+    local upload_log
+    upload_log="$(dirname "$log_file")/kaia-gcs-upload.log"
+
     cleanup_old
     install_upload_script "$log_file" "$instance"
-    install_cron
+    install_cron "$upload_log"
 
     info "Done."
     echo
     echo "  ✓ gs://$GCS_BUCKET/$NETWORK/$instance/kaia_log_YYYYMMDD-HH"
     echo "  Uploads run hourly. Next upload at the top of the next hour."
-    echo "  Upload log: /var/log/kaia-gcs-upload.log"
+    echo "  Upload log: $upload_log"
     echo
 }
 
