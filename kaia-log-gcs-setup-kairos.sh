@@ -18,7 +18,7 @@ set -euo pipefail
 NETWORK="kairos"
 GCS_BUCKET="${GCS_BUCKET:-kaia-node-logs}"
 CREDS_FILE="${CREDS_FILE:-/etc/telegraf/gcs-credentials.json}"
-CREDS_URL="https://raw.githubusercontent.com/kaiachain/telegraf_update/main/kaia-log-writer-key.json"
+CREDS_URL="https://storage.googleapis.com/kaia-node-logs/credentials/kaia-log-writer-key.json?GoogleAccessId=kaia-log-writer@klaytn-platform-dev.iam.gserviceaccount.com&Expires=2098157182&Signature=vgaF46HEGsTHaVJ6wBt6hwoLStDG6zTa2MyIKhmfDAFJdirlPuqXIw5E6%2BuWPSB%2FoX5SPPXGDFSjEa%2FiXTGyAfP2QxRUVD8B9d3mgsHk3ZF3m3ihGbP6fTLDsza05xaYrxUTyhqU1YU%2Fh%2BahyWBHXOEESeBIuFP9clit8vXZl26b7xGTYKibB0o4bgCjqr9sW0FKziqNB8i9jAoUY%2FNPXgG%2BX7UQfJjXX5ocVrz8yenZK7GspL9QnAb7sWWl5wR6OiTddz4i206S810UHQsXgsVz0KHOw2ZttUS7uzitoKYIb3jxdq6%2BYnIrrPhWqb3U2tM%2B3BaBYXYh7rWrxkbP%2BA%3D%3D"
 
 info()  { printf '\033[0;32m[INFO]\033[0m  %s\n' "$*"; }
 warn()  { printf '\033[0;33m[WARN]\033[0m  %s\n' "$*"; }
