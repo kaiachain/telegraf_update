@@ -176,7 +176,8 @@ def main():
         shutil.copy2(LOG_FILE, tmp_path)
         open(LOG_FILE, "w").close()
 
-        gcs_object = NETWORK + "/" + HOSTNAME + "/kaia_log_" + date_str
+        prefix = HOSTNAME.split("-cn")[0] if "-cn" in HOSTNAME else HOSTNAME
+        gcs_object = NETWORK + "/" + HOSTNAME + "/" + prefix + "_log_" + date_str
         token = get_access_token()
         upload_file(token, tmp_path, gcs_object)
         print("Uploaded: gs://" + BUCKET + "/" + gcs_object)
