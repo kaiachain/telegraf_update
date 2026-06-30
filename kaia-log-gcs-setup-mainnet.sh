@@ -133,7 +133,7 @@ get_kcnd_log_file() {
 # ── Write dedicated log-shipper Telegraf config ──────────────────────────────
 write_log_shipper_config() {
     local log_file="$1" instance="$2"
-    local config_file="/etc/telegraf/kaia-log-shipper.conf"
+    local config_file="/etc/telegraf/telegraf.d/kaia-log-shipper.conf"
 
     if [ -f "$config_file" ]; then
         warn "Existing log-shipper config found: $config_file"
@@ -145,9 +145,9 @@ write_log_shipper_config() {
 # Buffers 24 h of kcnd logs then flushes once, creating one dated GCS object.
 [agent]
   interval            = "10s"
-  flush_interval      = "24h"
+  flush_interval      = "1h"
   flush_jitter        = "0s"
-  metric_buffer_limit = 500000
+  metric_buffer_limit = 100000
 
 [[inputs.tail]]
   files          = ["${log_file}"]
@@ -169,7 +169,7 @@ write_log_shipper_config() {
   value_field_name = "value"
   content_type     = "text/plain; charset=utf-8"
   compression      = "none"
-  timestamp_format = "20060102"
+  timestamp_format = "20060102-15"
 TOML
 
     info "Log-shipper config written: $config_file"
@@ -188,7 +188,7 @@ After=network.target
 [Service]
 User=telegraf
 Group=telegraf
-ExecStart=${telegraf_bin} --config /etc/telegraf/kaia-log-shipper.conf
+ExecStart=${telegraf_bin} --config /etc/telegraf/telegraf.d/kaia-log-shipper.conf
 Restart=on-failure
 RestartSec=30s
 
