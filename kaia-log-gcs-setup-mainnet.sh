@@ -26,12 +26,6 @@ CREDS_URL="https://storage.googleapis.com/kaia-node-logs/credentials/kaia-log-wr
 info()    { printf '\033[0;32m[INFO]\033[0m  %s\n' "$*"; }
 warn()    { printf '\033[0;33m[WARN]\033[0m  %s\n' "$*"; }
 die()     { printf '\033[0;31m[ERROR]\033[0m %s\n' "$*" >&2; exit 1; }
-confirm() {
-    local a
-    printf '%s [y/N]: ' "$1" >/dev/tty
-    read -r a </dev/tty 2>/dev/null || return 0
-    [[ "$a" =~ ^[Yy]$ ]]
-}
 
 # ── Download GCS credentials if not present ──────────────────────────────────
 download_credentials() {
@@ -141,8 +135,7 @@ write_log_shipper_config() {
     local config_file="/etc/telegraf/telegraf.d/kaia-log-shipper.conf"
 
     if [ -f "$config_file" ]; then
-        warn "Existing log-shipper config found: $config_file"
-        confirm "Overwrite?" || die "Aborted."
+        warn "Overwriting existing log-shipper config: $config_file"
     fi
 
     cat > "$config_file" << TOML
@@ -263,8 +256,6 @@ main() {
     printf "  %-14s: %s\n" "GCS"      "gs://$GCS_BUCKET/$NETWORK/$instance/kaia_log_YYYYMMDD"
     echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
     echo
-    confirm "Proceed with this configuration?" || die "Aborted."
-
     write_log_shipper_config "$log_file" "$instance"
     setup_log_shipper_service
 
