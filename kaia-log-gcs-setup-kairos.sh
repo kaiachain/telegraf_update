@@ -3,10 +3,13 @@
 # kaia-log-gcs-setup-kairos.sh
 # Run on a Kairos CN node — configures Telegraf to ship kcnd.out to GCS
 #
+# Creates a dedicated 'telegraf-log-shipper' service that buffers 24 h of
+# logs and flushes once per day, producing one dated GCS object per node:
+#   gs://kaia-node-logs/kairos/<hostname>/kaia_log_YYYYMMDD
+#
 # Prerequisites:
-#   - Telegraf installed and running (with -config-directory option)
+#   - Telegraf installed (telegraf binary + telegraf user)
 #   - kcnd running
-#   - Service account key at /etc/telegraf/gcs-credentials.json
 #
 # Usage:
 #   sudo ./kaia-log-gcs-setup-kairos.sh
@@ -20,9 +23,9 @@ GCS_BUCKET="${GCS_BUCKET:-kaia-node-logs}"
 CREDS_FILE="${CREDS_FILE:-/etc/telegraf/gcs-credentials.json}"
 CREDS_URL="https://storage.googleapis.com/kaia-node-logs/credentials/kaia-log-writer-key.json?GoogleAccessId=kaia-log-writer@klaytn-platform-dev.iam.gserviceaccount.com&Expires=2098157182&Signature=vgaF46HEGsTHaVJ6wBt6hwoLStDG6zTa2MyIKhmfDAFJdirlPuqXIw5E6%2BuWPSB%2FoX5SPPXGDFSjEa%2FiXTGyAfP2QxRUVD8B9d3mgsHk3ZF3m3ihGbP6fTLDsza05xaYrxUTyhqU1YU%2Fh%2BahyWBHXOEESeBIuFP9clit8vXZl26b7xGTYKibB0o4bgCjqr9sW0FKziqNB8i9jAoUY%2FNPXgG%2BX7UQfJjXX5ocVrz8yenZK7GspL9QnAb7sWWl5wR6OiTddz4i206S810UHQsXgsVz0KHOw2ZttUS7uzitoKYIb3jxdq6%2BYnIrrPhWqb3U2tM%2B3BaBYXYh7rWrxkbP%2BA%3D%3D"
 
-info()  { printf '\033[0;32m[INFO]\033[0m  %s\n' "$*"; }
-warn()  { printf '\033[0;33m[WARN]\033[0m  %s\n' "$*"; }
-die()   { printf '\033[0;31m[ERROR]\033[0m %s\n' "$*" >&2; exit 1; }
+info()    { printf '\033[0;32m[INFO]\033[0m  %s\n' "$*"; }
+warn()    { printf '\033[0;33m[WARN]\033[0m  %s\n' "$*"; }
+die()     { printf '\033[0;31m[ERROR]\033[0m %s\n' "$*" >&2; exit 1; }
 confirm() { local a; read -rp "$1 [y/N]: " a; [[ "$a" =~ ^[Yy]$ ]]; }
 
 # ── Download GCS credentials if not present ──────────────────────────────────
@@ -41,29 +44,10 @@ download_credentials() {
     info "GCS credentials saved: $CREDS_FILE"
 }
 
-# ── Parse a value from a TOML section ───────────────────────────────────────
-# Usage: parse_toml_section <file> <section> <key>
-# Example: parse_toml_section /etc/telegraf/telegraf.d/kaia.conf global_tags instance
-parse_toml_section() {
-    local file="$1" section="$2" key="$3"
-    awk -v section="$section" -v key="$key" '
-        $0 ~ "^\\[" section "\\]" { in_section=1; next }
-        /^\[/ { in_section=0 }
-        in_section && $0 ~ "^[[:space:]]*" key "[[:space:]]*=" {
-            sub(/^[[:space:]]*[^=]*=[[:space:]]*/, "")
-            gsub(/["\t\r]/, "")
-            sub(/#.*$/, "")
-            sub(/[[:space:]]+$/, "")
-            print; exit
-        }
-    ' "$file"
-}
-
-# ── Detect Telegraf -config-directory ───────────────────────────────────────
+# ── Detect Telegraf -config-directory (for cleanup only) ─────────────────────
 get_telegraf_config_dir() {
     local unit_content
-    unit_content=$(systemctl cat telegraf 2>/dev/null) \
-        || die "telegraf service not found."
+    unit_content=$(systemctl cat telegraf 2>/dev/null) || return 1
 
     local dir
     dir=$(echo "$unit_content" \
@@ -71,7 +55,6 @@ get_telegraf_config_dir() {
         | head -1 \
         | sed 's/^.*[= ]//')
 
-    # Fall back to reading the live process cmdline
     if [ -z "$dir" ]; then
         local pid
         pid=$(systemctl show telegraf --property=MainPID --value 2>/dev/null || echo "")
@@ -81,33 +64,11 @@ get_telegraf_config_dir() {
         fi
     fi
 
-    if [ -z "$dir" ]; then
-        warn "-config-directory not found. Using default: /etc/telegraf/telegraf.d"
-        dir="/etc/telegraf/telegraf.d"
-    fi
-
-    echo "${dir%/}"
-}
-
-# ── Select target conf file ──────────────────────────────────────────────────
-# Priority: kaia.conf > klaytn.conf > first .conf found > create kaia.conf
-get_target_conf_file() {
-    local config_dir="$1"
-
-    for preferred in kaia.conf klaytn.conf; do
-        [ -f "$config_dir/$preferred" ] && echo "$config_dir/$preferred" && return
-    done
-
-    local first
-    first=$(ls "$config_dir"/*.conf 2>/dev/null | grep -v '/telegraf\.conf$' | head -1 || true)
-    [ -n "$first" ] && echo "$first" && return
-
-    echo "$config_dir/kaia.conf"
+    [ -n "$dir" ] && echo "${dir%/}"
 }
 
 # ── Detect kcnd.out log file path ────────────────────────────────────────────
 get_kcnd_log_file() {
-    # 1. Parse --log.file from the running kcnd process cmdline
     local pid
     pid=$(systemctl show kcnd --property=MainPID --value 2>/dev/null || echo "")
     if [ -n "$pid" ] && [ "$pid" != "0" ] && [ -f "/proc/$pid/cmdline" ]; then
@@ -119,7 +80,6 @@ get_kcnd_log_file() {
         fi
     fi
 
-    # 2. Parse LOG_DIR from kcnd.conf
     for conf in /etc/kcnd/conf/kcnd.conf /var/kcnd/conf/kcnd.conf; do
         [ -f "$conf" ] || continue
         local log_dir
@@ -128,7 +88,6 @@ get_kcnd_log_file() {
         [ -n "$log_dir" ] && echo "${log_dir%/}/kcnd.out" && return
     done
 
-    # 3. Common paths
     for path in /var/kcnd/logs/kcnd.out /home/kcnd/logs/kcnd.out /opt/kcnd/logs/kcnd.out; do
         [ -f "$path" ] && echo "$path" && return
     done
@@ -136,24 +95,25 @@ get_kcnd_log_file() {
     echo ""
 }
 
-# ── Append Telegraf config block ─────────────────────────────────────────────
-write_telegraf_config() {
-    local conf_file="$1" log_file="$2" instance="$3"
+# ── Write dedicated log-shipper Telegraf config ──────────────────────────────
+write_log_shipper_config() {
+    local log_file="$1" instance="$2"
+    local config_file="/etc/telegraf/kaia-log-shipper.conf"
 
-    if grep -q '# BEGIN kaia-log-gcs' "$conf_file" 2>/dev/null; then
-        warn "Existing GCS log config found in $conf_file"
-        confirm "Remove old config and replace?" || die "Aborted."
-        local tmp; tmp=$(mktemp)
-        sed '/# BEGIN kaia-log-gcs/,/# END kaia-log-gcs/d' "$conf_file" > "$tmp"
-        mv "$tmp" "$conf_file"
-        info "Old config removed."
+    if [ -f "$config_file" ]; then
+        warn "Existing log-shipper config found: $config_file"
+        confirm "Overwrite?" || die "Aborted."
     fi
 
-    mkdir -p "$(dirname "$conf_file")"
+    cat > "$config_file" << TOML
+# Kaia CN log shipper — generated $(date -u '+%Y-%m-%dT%H:%M:%SZ')
+# Buffers 24 h of kcnd logs then flushes once, creating one dated GCS object.
+[agent]
+  interval            = "10s"
+  flush_interval      = "24h"
+  flush_jitter        = "0s"
+  metric_buffer_limit = 500000
 
-    cat >> "$conf_file" << TOML
-
-# BEGIN kaia-log-gcs ($(date -u '+%Y-%m-%dT%H:%M:%SZ'))
 [[inputs.tail]]
   files          = ["${log_file}"]
   from_beginning = false
@@ -166,115 +126,45 @@ write_telegraf_config() {
     network   = "${NETWORK}"
     kaia_host = "${instance}"
 
-[[outputs.file]]
-  namepass         = ["kaia_log"]
-  files            = ["/var/log/kaia-logs/kcnd.log"]
+[[outputs.google_cloud_storage]]
+  bucket           = "${GCS_BUCKET}"
+  path_prefix      = "${NETWORK}/${instance}/"
+  credentials_file = "${CREDS_FILE}"
   data_format      = "value"
   value_field_name = "value"
-# END kaia-log-gcs
+  content_type     = "text/plain; charset=utf-8"
+  compression      = "none"
+  timestamp_format = "20060102"
 TOML
 
-    info "Config written to: $conf_file"
+    info "Log-shipper config written: $config_file"
 }
 
-# ── Install GCS upload script and logrotate config ───────────────────────────
-setup_local_upload() {
-    local instance="$1"
+# ── Create and start telegraf-log-shipper systemd service ────────────────────
+setup_log_shipper_service() {
+    local telegraf_bin
+    telegraf_bin=$(command -v telegraf 2>/dev/null || echo "/usr/bin/telegraf")
 
-    mkdir -p /var/log/kaia-logs
-    chown telegraf:telegraf /var/log/kaia-logs
-    chmod 755 /var/log/kaia-logs
+    cat > /etc/systemd/system/telegraf-log-shipper.service << EOF
+[Unit]
+Description=Telegraf Log Shipper for Kaia CN Node
+After=network.target
 
-    cat > /usr/local/bin/kaia-log-gcs-upload << PYEOF
-#!/usr/bin/env python3
-import json, os, glob, time, base64
-import urllib.request, urllib.parse
-from cryptography.hazmat.primitives import hashes, serialization
-from cryptography.hazmat.primitives.asymmetric import padding
+[Service]
+User=telegraf
+Group=telegraf
+ExecStart=${telegraf_bin} --config /etc/telegraf/kaia-log-shipper.conf
+Restart=on-failure
+RestartSec=30s
 
-NETWORK  = "${NETWORK}"
-HOSTNAME = "${instance}"
-BUCKET   = "${GCS_BUCKET}"
-KEY_FILE = "${CREDS_FILE}"
-LOG_DIR  = "/var/log/kaia-logs"
+[Install]
+WantedBy=multi-user.target
+EOF
 
-def get_access_token():
-    with open(KEY_FILE) as f:
-        k = json.load(f)
-    now = int(time.time())
-    hdr = base64.urlsafe_b64encode(b'{"alg":"RS256","typ":"JWT"}').rstrip(b'=')
-    clm = json.dumps({
-        "iss": k["client_email"],
-        "scope": "https://www.googleapis.com/auth/devstorage.read_write",
-        "aud":   "https://oauth2.googleapis.com/token",
-        "iat": now, "exp": now + 3600,
-    }).encode()
-    pay = base64.urlsafe_b64encode(clm).rstrip(b'=')
-    msg = hdr + b"." + pay
-    key = serialization.load_pem_private_key(k["private_key"].encode(), password=None)
-    sig = base64.urlsafe_b64encode(
-        key.sign(msg, padding.PKCS1v15(), hashes.SHA256())
-    ).rstrip(b'=')
-    jwt_token = (msg + b"." + sig).decode()
-    data = urllib.parse.urlencode({
-        "grant_type": "urn:ietf:params:oauth:grant-type:jwt-bearer",
-        "assertion": jwt_token,
-    }).encode()
-    req = urllib.request.Request("https://oauth2.googleapis.com/token", data=data)
-    with urllib.request.urlopen(req) as r:
-        return json.loads(r.read())["access_token"]
-
-def upload_file(token, local_path, gcs_object):
-    url = (
-        "https://storage.googleapis.com/upload/storage/v1/b/"
-        + BUCKET + "/o?uploadType=media"
-        + "&name=" + urllib.parse.quote(gcs_object, safe="")
-    )
-    with open(local_path, "rb") as f:
-        content = f.read()
-    req = urllib.request.Request(url, data=content, method="POST")
-    req.add_header("Authorization", "Bearer " + token)
-    req.add_header("Content-Type", "text/plain; charset=utf-8")
-    with urllib.request.urlopen(req) as r:
-        r.read()
-
-def main():
-    # logrotate creates kcnd.log-YYYYMMDD (dateext format)
-    files = sorted(glob.glob(os.path.join(LOG_DIR, "kcnd.log-????????")))
-    if not files:
-        print("No rotated log files found.")
-        return
-    token = get_access_token()
-    for path in files:
-        date_str   = os.path.basename(path).replace("kcnd.log-", "")
-        gcs_object = NETWORK + "/" + HOSTNAME + "/kcnd-" + date_str + ".log"
-        upload_file(token, path, gcs_object)
-        os.remove(path)
-        print("Uploaded: gs://" + BUCKET + "/" + gcs_object)
-
-if __name__ == "__main__":
-    main()
-PYEOF
-
-    chmod 755 /usr/local/bin/kaia-log-gcs-upload
-    info "Upload script installed: /usr/local/bin/kaia-log-gcs-upload"
-
-    cat > /etc/logrotate.d/kaia-log-gcs << 'LOGROF'
-/var/log/kaia-logs/kcnd.log {
-    daily
-    rotate 3
-    dateext
-    dateformat -%Y%m%d
-    missingok
-    notifempty
-    copytruncate
-    postrotate
-        /usr/local/bin/kaia-log-gcs-upload >> /var/log/kaia-gcs-upload.log 2>&1 || true
-    endscript
-}
-LOGROF
-
-    info "logrotate config installed: /etc/logrotate.d/kaia-log-gcs"
+    systemctl daemon-reload
+    systemctl enable telegraf-log-shipper
+    systemctl restart telegraf-log-shipper
+    info "telegraf-log-shipper service enabled and started."
 }
 
 # ── Main ─────────────────────────────────────────────────────────────────────
@@ -290,23 +180,10 @@ main() {
     download_credentials
     info "GCS credentials: $CREDS_FILE"
 
-    systemctl is-active telegraf >/dev/null 2>&1 || warn "Telegraf is not currently running."
-
-    local config_dir
-    config_dir=$(get_telegraf_config_dir)
-    [ -d "$config_dir" ] || die "Telegraf config directory not found: $config_dir"
-    info "Telegraf config directory: $config_dir"
-
-    local conf_file
-    conf_file=$(get_target_conf_file "$config_dir")
-    info "Config file: $conf_file"
-
-    # Use the system hostname as-is for the GCS folder name
     local instance
     instance=$(hostname -s)
     info "instance (hostname): $instance"
 
-    # Detect kcnd.out path
     local log_file
     log_file=$(get_kcnd_log_file)
     if [ -z "$log_file" ]; then
@@ -316,27 +193,37 @@ main() {
     [ -f "$log_file" ] || warn "Log file does not exist yet: $log_file (Telegraf will tail it once created)"
     info "Log file: $log_file"
 
+    # Remove any old kaia-log-gcs block from the main Telegraf config (cleanup)
+    local config_dir
+    config_dir=$(get_telegraf_config_dir 2>/dev/null || true)
+    if [ -n "$config_dir" ] && [ -d "$config_dir" ]; then
+        for f in "$config_dir"/*.conf; do
+            [ -f "$f" ] || continue
+            if grep -q '# BEGIN kaia-log-gcs' "$f" 2>/dev/null; then
+                info "Removing old kaia-log-gcs block from $f"
+                local tmp; tmp=$(mktemp)
+                sed '/# BEGIN kaia-log-gcs/,/# END kaia-log-gcs/d' "$f" > "$tmp"
+                mv "$tmp" "$f"
+            fi
+        done
+    fi
+
     echo
     echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-    printf "  %-14s: %s\n" "network"    "$NETWORK"
-    printf "  %-14s: %s\n" "instance"   "$instance"
-    printf "  %-14s: %s\n" "log file"   "$log_file"
-    printf "  %-14s: %s\n" "conf file"  "$conf_file"
-    printf "  %-14s: %s\n" "GCS path"   "gs://$GCS_BUCKET/$NETWORK/$instance/"
+    printf "  %-14s: %s\n" "network"  "$NETWORK"
+    printf "  %-14s: %s\n" "instance" "$instance"
+    printf "  %-14s: %s\n" "log file" "$log_file"
+    printf "  %-14s: %s\n" "GCS"      "gs://$GCS_BUCKET/$NETWORK/$instance/kaia_log_YYYYMMDD"
     echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
     echo
     confirm "Proceed with this configuration?" || die "Aborted."
 
-    write_telegraf_config "$conf_file" "$log_file" "$instance"
-    setup_local_upload "$instance"
-
-    info "Restarting Telegraf..."
-    systemctl reload telegraf 2>/dev/null || systemctl restart telegraf
-    info "Done."
+    write_log_shipper_config "$log_file" "$instance"
+    setup_log_shipper_service
 
     echo
-    echo "  ✓ gs://$GCS_BUCKET/$NETWORK/$instance/"
-    echo "  journalctl -u telegraf -f  (to tail Telegraf logs)"
+    echo "  ✓ gs://$GCS_BUCKET/$NETWORK/$instance/kaia_log_YYYYMMDD"
+    echo "  journalctl -u telegraf-log-shipper -f  (to tail log shipper)"
     echo
 }
 
