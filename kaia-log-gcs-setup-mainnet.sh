@@ -188,18 +188,37 @@ def get_access_token():
         return json.loads(r.read())["access_token"]
 
 def upload_file(token, local_path, gcs_object):
-    url = (
+    file_size = os.path.getsize(local_path)
+
+    # Initiate resumable upload session (handles files of any size)
+    init_url = (
         "https://storage.googleapis.com/upload/storage/v1/b/"
-        + BUCKET + "/o?uploadType=media"
+        + BUCKET + "/o?uploadType=resumable"
         + "&name=" + urllib.parse.quote(gcs_object, safe="")
     )
-    with open(local_path, "rb") as f:
-        content = f.read()
-    req = urllib.request.Request(url, data=content, method="POST")
-    req.add_header("Authorization", "Bearer " + token)
-    req.add_header("Content-Type", "text/plain; charset=utf-8")
-    with urllib.request.urlopen(req) as r:
-        r.read()
+    init_req = urllib.request.Request(init_url, data=b'', method="POST")
+    init_req.add_header("Authorization", "Bearer " + token)
+    init_req.add_header("Content-Type", "application/json; charset=UTF-8")
+    init_req.add_header("X-Upload-Content-Type", "text/plain; charset=utf-8")
+    init_req.add_header("X-Upload-Content-Length", str(file_size))
+    try:
+        with urllib.request.urlopen(init_req) as r:
+            upload_url = r.headers["Location"]
+            r.read()
+    except urllib.error.HTTPError as e:
+        body = e.read().decode(errors="replace")
+        raise RuntimeError(f"GCS initiate upload failed HTTP {e.code}: {body}")
+
+    # Upload via curl to stream directly from disk (avoids loading into memory)
+    result = subprocess.run(
+        ["curl", "-s", "-w", "%{http_code}", "-X", "PUT", upload_url,
+         "-H", "Content-Type: text/plain; charset=utf-8",
+         "-T", local_path],
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE
+    )
+    http_code = result.stdout[-3:].decode()
+    if result.returncode != 0 or not http_code.startswith("2"):
+        raise RuntimeError(f"curl upload failed (HTTP {http_code}): {result.stdout[:-3].decode(errors='replace')}")
 
 def main():
     if not os.path.exists(LOG_FILE) or os.path.getsize(LOG_FILE) == 0:
