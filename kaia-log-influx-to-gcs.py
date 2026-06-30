@@ -27,7 +27,7 @@ def influx_query(db, q):
 
 
 def get_instances(db):
-    result = influx_query(db, "SHOW TAG VALUES FROM kcnd_log WITH KEY = instance")
+    result = influx_query(db, "SHOW TAG VALUES FROM kaia_log WITH KEY = instance")
     try:
         return [row[1] for row in result["results"][0]["series"][0]["values"]]
     except (KeyError, IndexError):
@@ -36,7 +36,7 @@ def get_instances(db):
 
 def get_logs(db, instance, start, end):
     q = (
-        f"SELECT value FROM kcnd_log "
+        f"SELECT value FROM kaia_log "
         f"WHERE instance='{instance}' "
         f"AND time >= '{start}' AND time < '{end}' "
         f"ORDER BY time ASC"
