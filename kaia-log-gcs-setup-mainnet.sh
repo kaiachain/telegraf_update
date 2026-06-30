@@ -5,12 +5,15 @@
 #
 # Flow:
 #   kcnd → --log.file (e.g. /var/kcnd/logs/kcnd.out)
-#        → [telegraf inputs.tail] → [outputs.file → /var/kcnd/logs/kcnd.log]
+#        → [telegraf-log-shipper: inputs.tail → outputs.file → kcnd.log]
 #        → [hourly cron /usr/local/bin/kaia-log-gcs-upload]
 #        → gs://kaia-node-logs/mainnet/<instance>/kaia_log_YYYYMMDD-HH
 #
+# The log-shipper config lives at /etc/telegraf/kaia-log-shipper.conf
+# (NOT inside telegraf.d/) so the main telegraf service is unaffected.
+#
 # Prerequisites:
-#   - Telegraf installed and running (with --config-directory telegraf.d)
+#   - Telegraf installed (binary + telegraf user)
 #   - kcnd running
 #   - python3 + cryptography library installed
 #
@@ -26,7 +29,9 @@ GCS_BUCKET="${GCS_BUCKET:-kaia-node-logs}"
 CREDS_FILE="${CREDS_FILE:-/etc/telegraf/gcs-credentials.json}"
 CREDS_URL="https://storage.googleapis.com/kaia-node-logs/credentials/kaia-log-writer-key.json?GoogleAccessId=kaia-log-writer@klaytn-platform-dev.iam.gserviceaccount.com&Expires=2098157182&Signature=vgaF46HEGsTHaVJ6wBt6hwoLStDG6zTa2MyIKhmfDAFJdirlPuqXIw5E6%2BuWPSB%2FoX5SPPXGDFSjEa%2FiXTGyAfP2QxRUVD8B9d3mgsHk3ZF3m3ihGbP6fTLDsza05xaYrxUTyhqU1YU%2Fh%2BahyWBHXOEESeBIuFP9clit8vXZl26b7xGTYKibB0o4bgCjqr9sW0FKziqNB8i9jAoUY%2FNPXgG%2BX7UQfJjXX5ocVrz8yenZK7GspL9QnAb7sWWl5wR6OiTddz4i206S810UHQsXgsVz0KHOw2ZttUS7uzitoKYIb3jxdq6%2BYnIrrPhWqb3U2tM%2B3BaBYXYh7rWrxkbP%2BA%3D%3D"
 
-SHIPPER_CONF="/etc/telegraf/telegraf.d/kaia-log-shipper.conf"
+# Config lives OUTSIDE telegraf.d/ to avoid being loaded by the main telegraf
+SHIPPER_CONF="/etc/telegraf/kaia-log-shipper.conf"
+SHIPPER_SERVICE="/etc/systemd/system/telegraf-log-shipper.service"
 UPLOAD_SCRIPT="/usr/local/bin/kaia-log-gcs-upload"
 CRON_FILE="/etc/cron.d/kaia-log-gcs"
 
@@ -131,18 +136,23 @@ get_kcnd_log_file() {
     echo ""
 }
 
-# ── Write Telegraf config ─────────────────────────────────────────────────────
-# inputs.tail reads from --log.file (kcnd.out)
-# outputs.file writes to kcnd.log in the same directory
-write_telegraf_config() {
+# ── Write log-shipper Telegraf config ────────────────────────────────────────
+# Placed at /etc/telegraf/kaia-log-shipper.conf (not in telegraf.d/)
+# so the main telegraf service does not load it.
+write_shipper_config() {
     local log_file="$1" local_log="$2" instance="$3"
 
     [ -f "$SHIPPER_CONF" ] && warn "Overwriting existing config: $SHIPPER_CONF"
 
     cat > "$SHIPPER_CONF" << TOML
 # Kaia CN log shipper — generated $(date -u '+%Y-%m-%dT%H:%M:%SZ')
+# Loaded only by telegraf-log-shipper.service, NOT by the main telegraf.
 # inputs.tail reads kcnd.out; outputs.file writes to kcnd.log (same dir).
 # Hourly cron (kaia-log-gcs-upload) copytruncates kcnd.log and uploads to GCS.
+
+[agent]
+  interval       = "10s"
+  flush_interval = "10s"
 
 [[inputs.tail]]
   files          = ["${log_file}"]
@@ -157,13 +167,39 @@ write_telegraf_config() {
     kaia_host = "${instance}"
 
 [[outputs.file]]
-  namepass         = ["kaia_log"]
   files            = ["${local_log}"]
   data_format      = "value"
   value_field_name = "value"
 TOML
 
-    info "Telegraf config written: $SHIPPER_CONF"
+    info "Log-shipper config written: $SHIPPER_CONF"
+}
+
+# ── Create telegraf-log-shipper systemd service ───────────────────────────────
+setup_shipper_service() {
+    local telegraf_bin
+    telegraf_bin=$(command -v telegraf 2>/dev/null || echo "/usr/bin/telegraf")
+
+    cat > "$SHIPPER_SERVICE" << EOF
+[Unit]
+Description=Telegraf Log Shipper for Kaia CN Node
+After=network.target
+
+[Service]
+User=telegraf
+Group=telegraf
+ExecStart=${telegraf_bin} --config ${SHIPPER_CONF}
+Restart=on-failure
+RestartSec=30s
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+    systemctl daemon-reload
+    systemctl enable telegraf-log-shipper
+    systemctl restart telegraf-log-shipper
+    info "telegraf-log-shipper service enabled and started."
 }
 
 # ── Install hourly GCS upload script ─────────────────────────────────────────
@@ -173,8 +209,8 @@ install_upload_script() {
     cat > "$UPLOAD_SCRIPT" << PYEOF
 #!/usr/bin/env python3
 """
-Copytruncate kcnd.log (Telegraf's output) and upload the previous hour's
-content to GCS. Called every hour by cron.
+Copytruncate kcnd.log (written by telegraf-log-shipper) and upload the
+previous hour's content to GCS. Called every hour by cron.
 """
 import json, os, time, base64, shutil, datetime, tempfile
 import urllib.request, urllib.parse
@@ -235,7 +271,7 @@ def main():
     prev     = datetime.datetime.utcnow() - datetime.timedelta(hours=1)
     date_str = prev.strftime("%Y%m%d-%H")
 
-    # copytruncate into a temp file so Telegraf keeps writing uninterrupted
+    # copytruncate into a temp file so telegraf-log-shipper keeps writing
     tmp_fd, tmp_path = tempfile.mkstemp(suffix=".log", prefix="kaia-log-")
     os.close(tmp_fd)
     try:
@@ -268,15 +304,13 @@ EOF
     info "Cron job installed: $CRON_FILE"
 }
 
-# ── Clean up previous telegraf-log-shipper service ───────────────────────────
-cleanup_old_service() {
-    if systemctl is-active telegraf-log-shipper >/dev/null 2>&1 || \
-       systemctl is-enabled telegraf-log-shipper >/dev/null 2>&1; then
-        info "Removing previous telegraf-log-shipper service..."
-        systemctl stop telegraf-log-shipper 2>/dev/null || true
-        systemctl disable telegraf-log-shipper 2>/dev/null || true
-        rm -f /etc/systemd/system/telegraf-log-shipper.service
-        systemctl daemon-reload
+# ── Clean up stale files from previous installations ─────────────────────────
+cleanup_old() {
+    local old_conf="/etc/telegraf/telegraf.d/kaia-log-shipper.conf"
+    if [ -f "$old_conf" ]; then
+        info "Removing stale config from telegraf.d/: $old_conf"
+        rm -f "$old_conf"
+        systemctl reload telegraf 2>/dev/null || true
     fi
 }
 
@@ -316,7 +350,6 @@ main() {
     [ -f "$log_file" ] || warn "Log file does not exist yet: $log_file"
     info "Log file (--log.file): $log_file"
 
-    # kcnd.log lives in the same directory as kcnd.out (--log.file)
     local log_dir local_log upload_log
     log_dir="$(dirname "$log_file")"
     local_log="${log_dir}/kcnd.log"
@@ -337,19 +370,19 @@ main() {
     echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
     echo
 
-    cleanup_old_service
-    write_telegraf_config "$log_file" "$local_log" "$instance"
+    cleanup_old
+    write_shipper_config "$log_file" "$local_log" "$instance"
+    setup_shipper_service
     install_upload_script "$local_log" "$instance"
     install_cron "$upload_log"
 
-    info "Reloading Telegraf..."
-    systemctl reload telegraf 2>/dev/null || systemctl restart telegraf
     info "Done."
-
     echo
     echo "  ✓ gs://$GCS_BUCKET/$NETWORK/$instance/kaia_log_YYYYMMDD-HH"
     echo "  Uploads run hourly. Next upload at the top of the next hour."
     echo "  Upload log: $upload_log"
+    echo
+    echo "  journalctl -u telegraf-log-shipper -f   (to tail log shipper)"
     echo
 }
 
