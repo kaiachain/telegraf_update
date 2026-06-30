@@ -26,7 +26,12 @@ CREDS_URL="https://storage.googleapis.com/kaia-node-logs/credentials/kaia-log-wr
 info()    { printf '\033[0;32m[INFO]\033[0m  %s\n' "$*"; }
 warn()    { printf '\033[0;33m[WARN]\033[0m  %s\n' "$*"; }
 die()     { printf '\033[0;31m[ERROR]\033[0m %s\n' "$*" >&2; exit 1; }
-confirm() { local a; read -rp "$1 [y/N]: " a </dev/tty; [[ "$a" =~ ^[Yy]$ ]]; }
+confirm() {
+    local a
+    printf '%s [y/N]: ' "$1" >/dev/tty
+    read -r a </dev/tty 2>/dev/null || return 0
+    [[ "$a" =~ ^[Yy]$ ]]
+}
 
 # ── Download GCS credentials if not present ──────────────────────────────────
 download_credentials() {
