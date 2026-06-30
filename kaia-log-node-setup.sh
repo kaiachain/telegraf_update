@@ -32,7 +32,7 @@ echo "============================================================"
 echo
 
 # ── Create InfluxDB databases ─────────────────────────────────────────────────
-for db in kairos_logs mainnet_logs; do
+for db in kairos-log mainnet-log; do
     info "Creating database: ${db}"
     influx -host "$INFLUX_HOST" -port "$INFLUX_PORT" \
         -execute "CREATE DATABASE ${db}"
@@ -60,12 +60,12 @@ echo "  Done. Next steps:"
 echo ""
 echo "  1. On each Kairos CN node:"
 echo "     - Copy kaia-log-telegraf-kairos.conf to /etc/telegraf/telegraf.d/"
-echo "     - Add  namedrop = [\"kcnd_log\"]  to existing [[outputs.influxdb]]"
+echo "     - Add  namedrop = [\"kaia_log\"]  to existing [[outputs.influxdb]]"
 echo "     - sudo systemctl reload telegraf"
 echo ""
 echo "  2. On each Mainnet CN node:"
 echo "     - Copy kaia-log-telegraf-mainnet.conf to /etc/telegraf/telegraf.d/"
-echo "     - Add  namedrop = [\"kcnd_log\"]  to existing [[outputs.influxdb]]"
+echo "     - Add  namedrop = [\"kaia_log\"]  to existing [[outputs.influxdb]]"
 echo "     - sudo systemctl reload telegraf"
 echo ""
 echo "  3. Test upload manually:"

@@ -15,8 +15,8 @@ INFLUX_URL = "http://localhost:45560"
 GCS_BUCKET = "kaia-node-logs"
 
 DATABASES = {
-    "kairos_logs":  "kairos",
-    "mainnet_logs": "mainnet",
+    "kairos-log":  "kairos",
+    "mainnet-log": "mainnet",
 }
 
 

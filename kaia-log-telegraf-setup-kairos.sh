@@ -11,7 +11,7 @@ set -euo pipefail
 
 NETWORK="kairos"
 INFLUX_URL="${INFLUX_URL:-http://node.kaia.io:45560}"
-INFLUX_DB="kairos_logs"
+INFLUX_DB="kairos-log"
 CONF_FILE="/etc/telegraf/telegraf.d/kaia_log.conf"
 
 info() { printf '\033[0;32m[INFO]\033[0m  %s\n' "$*"; }
