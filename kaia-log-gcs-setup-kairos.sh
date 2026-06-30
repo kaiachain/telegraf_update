@@ -79,11 +79,10 @@ install_upload_script() {
 """
 Copytruncate kcnd's --log.file and upload the previous hour's content to GCS.
 Called every hour by cron (runs as root).
+Uses openssl for RSA signing — no third-party Python libraries required.
 """
-import json, os, time, base64, shutil, datetime, tempfile
+import json, os, time, base64, shutil, datetime, tempfile, subprocess
 import urllib.request, urllib.parse
-from cryptography.hazmat.primitives import hashes, serialization
-from cryptography.hazmat.primitives.asymmetric import padding
 
 NETWORK  = "${NETWORK}"
 HOSTNAME = "${instance}"
@@ -95,20 +94,33 @@ def get_access_token():
     with open(KEY_FILE) as f:
         k = json.load(f)
     now = int(time.time())
-    hdr = base64.urlsafe_b64encode(b'{"alg":"RS256","typ":"JWT"}').rstrip(b'=')
-    clm = json.dumps({
+    hdr = base64.urlsafe_b64encode(b'{"alg":"RS256","typ":"JWT"}').rstrip(b'=').decode()
+    clm = base64.urlsafe_b64encode(json.dumps({
         "iss": k["client_email"],
         "scope": "https://www.googleapis.com/auth/devstorage.read_write",
         "aud":   "https://oauth2.googleapis.com/token",
         "iat": now, "exp": now + 3600,
-    }).encode()
-    pay = base64.urlsafe_b64encode(clm).rstrip(b'=')
-    msg = hdr + b"." + pay
-    key = serialization.load_pem_private_key(k["private_key"].encode(), password=None)
-    sig = base64.urlsafe_b64encode(
-        key.sign(msg, padding.PKCS1v15(), hashes.SHA256())
-    ).rstrip(b'=')
-    jwt_token = (msg + b"." + sig).decode()
+    }).encode()).rstrip(b'=').decode()
+    signing_input = (hdr + "." + clm).encode()
+
+    # Write private key to a temp file and sign with openssl
+    tmp = tempfile.NamedTemporaryFile(mode='w', suffix='.pem', delete=False)
+    try:
+        tmp.write(k["private_key"])
+        tmp.flush()
+        tmp.close()
+        result = subprocess.run(
+            ["openssl", "dgst", "-sha256", "-sign", tmp.name],
+            input=signing_input,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE
+        )
+        if result.returncode != 0:
+            raise RuntimeError("openssl signing failed: " + result.stderr.decode())
+        sig = base64.urlsafe_b64encode(result.stdout).rstrip(b'=').decode()
+    finally:
+        os.unlink(tmp.name)
+
+    jwt_token = hdr + "." + clm + "." + sig
     data = urllib.parse.urlencode({
         "grant_type": "urn:ietf:params:oauth:grant-type:jwt-bearer",
         "assertion": jwt_token,
