@@ -18,11 +18,28 @@ set -euo pipefail
 NETWORK="mainnet"
 GCS_BUCKET="${GCS_BUCKET:-kaia-node-logs}"
 CREDS_FILE="${CREDS_FILE:-/etc/telegraf/gcs-credentials.json}"
+CREDS_URL="https://raw.githubusercontent.com/kaiachain/telegraf_update/main/kaia-log-writer-key.json"
 
 info()  { printf '\033[0;32m[INFO]\033[0m  %s\n' "$*"; }
 warn()  { printf '\033[0;33m[WARN]\033[0m  %s\n' "$*"; }
 die()   { printf '\033[0;31m[ERROR]\033[0m %s\n' "$*" >&2; exit 1; }
 confirm() { local a; read -rp "$1 [y/N]: " a; [[ "$a" =~ ^[Yy]$ ]]; }
+
+# ── Download GCS credentials if not present ──────────────────────────────────
+download_credentials() {
+    if [ -f "$CREDS_FILE" ]; then
+        info "GCS credentials already exist: $CREDS_FILE"
+        return
+    fi
+
+    info "Downloading GCS credentials..."
+    mkdir -p "$(dirname "$CREDS_FILE")"
+    curl -sSL "$CREDS_URL" -o "$CREDS_FILE" \
+        || die "Failed to download credentials from $CREDS_URL"
+    chown telegraf:telegraf "$CREDS_FILE"
+    chmod 600 "$CREDS_FILE"
+    info "GCS credentials saved: $CREDS_FILE"
+}
 
 # ── Parse a value from a TOML section ───────────────────────────────────────
 # Usage: parse_toml_section <file> <section> <key>
@@ -175,7 +192,7 @@ main() {
 
     [ "$(id -u)" -eq 0 ] || die "Must be run as root: sudo $0"
 
-    [ -f "$CREDS_FILE" ] || die "GCS credentials not found: ${CREDS_FILE}\n  sudo cp kaia-log-writer-key.json ${CREDS_FILE}\n  sudo chown telegraf:telegraf ${CREDS_FILE} && sudo chmod 600 ${CREDS_FILE}"
+    download_credentials
     info "GCS credentials: $CREDS_FILE"
 
     systemctl is-active telegraf >/dev/null 2>&1 || warn "Telegraf is not currently running."
