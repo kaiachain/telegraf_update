@@ -166,20 +166,115 @@ write_telegraf_config() {
     network   = "${NETWORK}"
     kaia_host = "${instance}"
 
-[[outputs.google_cloud_storage]]
+[[outputs.file]]
   namepass         = ["kaia_log"]
-  bucket           = "${GCS_BUCKET}"
-  path_prefix      = "${NETWORK}/${instance}/"
-  credentials_file = "${CREDS_FILE}"
+  files            = ["/var/log/kaia-logs/kcnd.log"]
   data_format      = "value"
   value_field_name = "value"
-  content_type     = "text/plain; charset=utf-8"
-  compression      = "none"
-  timestamp_format = "20060102-150405"
 # END kaia-log-gcs
 TOML
 
     info "Config written to: $conf_file"
+}
+
+# ── Install GCS upload script and logrotate config ───────────────────────────
+setup_local_upload() {
+    local instance="$1"
+
+    mkdir -p /var/log/kaia-logs
+    chown telegraf:telegraf /var/log/kaia-logs
+    chmod 755 /var/log/kaia-logs
+
+    cat > /usr/local/bin/kaia-log-gcs-upload << PYEOF
+#!/usr/bin/env python3
+import json, os, glob, time, base64
+import urllib.request, urllib.parse
+from cryptography.hazmat.primitives import hashes, serialization
+from cryptography.hazmat.primitives.asymmetric import padding
+
+NETWORK  = "${NETWORK}"
+HOSTNAME = "${instance}"
+BUCKET   = "${GCS_BUCKET}"
+KEY_FILE = "${CREDS_FILE}"
+LOG_DIR  = "/var/log/kaia-logs"
+
+def get_access_token():
+    with open(KEY_FILE) as f:
+        k = json.load(f)
+    now = int(time.time())
+    hdr = base64.urlsafe_b64encode(b'{"alg":"RS256","typ":"JWT"}').rstrip(b'=')
+    clm = json.dumps({
+        "iss": k["client_email"],
+        "scope": "https://www.googleapis.com/auth/devstorage.read_write",
+        "aud":   "https://oauth2.googleapis.com/token",
+        "iat": now, "exp": now + 3600,
+    }).encode()
+    pay = base64.urlsafe_b64encode(clm).rstrip(b'=')
+    msg = hdr + b"." + pay
+    key = serialization.load_pem_private_key(k["private_key"].encode(), password=None)
+    sig = base64.urlsafe_b64encode(
+        key.sign(msg, padding.PKCS1v15(), hashes.SHA256())
+    ).rstrip(b'=')
+    jwt_token = (msg + b"." + sig).decode()
+    data = urllib.parse.urlencode({
+        "grant_type": "urn:ietf:params:oauth:grant-type:jwt-bearer",
+        "assertion": jwt_token,
+    }).encode()
+    req = urllib.request.Request("https://oauth2.googleapis.com/token", data=data)
+    with urllib.request.urlopen(req) as r:
+        return json.loads(r.read())["access_token"]
+
+def upload_file(token, local_path, gcs_object):
+    url = (
+        "https://storage.googleapis.com/upload/storage/v1/b/"
+        + BUCKET + "/o?uploadType=media"
+        + "&name=" + urllib.parse.quote(gcs_object, safe="")
+    )
+    with open(local_path, "rb") as f:
+        content = f.read()
+    req = urllib.request.Request(url, data=content, method="POST")
+    req.add_header("Authorization", "Bearer " + token)
+    req.add_header("Content-Type", "text/plain; charset=utf-8")
+    with urllib.request.urlopen(req) as r:
+        r.read()
+
+def main():
+    # logrotate creates kcnd.log-YYYYMMDD (dateext format)
+    files = sorted(glob.glob(os.path.join(LOG_DIR, "kcnd.log-????????")))
+    if not files:
+        print("No rotated log files found.")
+        return
+    token = get_access_token()
+    for path in files:
+        date_str   = os.path.basename(path).replace("kcnd.log-", "")
+        gcs_object = NETWORK + "/" + HOSTNAME + "/kcnd-" + date_str + ".log"
+        upload_file(token, path, gcs_object)
+        os.remove(path)
+        print("Uploaded: gs://" + BUCKET + "/" + gcs_object)
+
+if __name__ == "__main__":
+    main()
+PYEOF
+
+    chmod 755 /usr/local/bin/kaia-log-gcs-upload
+    info "Upload script installed: /usr/local/bin/kaia-log-gcs-upload"
+
+    cat > /etc/logrotate.d/kaia-log-gcs << 'LOGROF'
+/var/log/kaia-logs/kcnd.log {
+    daily
+    rotate 3
+    dateext
+    dateformat -%Y%m%d
+    missingok
+    notifempty
+    copytruncate
+    postrotate
+        /usr/local/bin/kaia-log-gcs-upload >> /var/log/kaia-gcs-upload.log 2>&1 || true
+    endscript
+}
+LOGROF
+
+    info "logrotate config installed: /etc/logrotate.d/kaia-log-gcs"
 }
 
 # ── Main ─────────────────────────────────────────────────────────────────────
@@ -233,6 +328,7 @@ main() {
     confirm "Proceed with this configuration?" || die "Aborted."
 
     write_telegraf_config "$conf_file" "$log_file" "$instance"
+    setup_local_upload "$instance"
 
     info "Restarting Telegraf..."
     systemctl reload telegraf 2>/dev/null || systemctl restart telegraf
