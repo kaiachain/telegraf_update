@@ -12,7 +12,8 @@ set -euo pipefail
 NETWORK="kairos"
 INFLUX_URL="${INFLUX_URL:-http://node.kaia.io:45560}"
 INFLUX_DB="kairos_logs"
-CONF_FILE="/etc/telegraf/telegraf.d/kaia_log.conf"
+CONF_DIR="/etc/telegraf/telegraf.d"
+CONF_FILE="${CONF_DIR}/kaia_log.conf"
 
 info() { printf '\033[0;32m[INFO]\033[0m  %s\n' "$*"; }
 warn() { printf '\033[0;33m[WARN]\033[0m  %s\n' "$*"; }
@@ -58,27 +59,81 @@ detect_kaia_log_file() {
     done
 }
 
+# ── Does this node use telegraf.d/ at all? ───────────────────────────────────
+# Most nodes have their metrics config in a *.conf file under telegraf.d/
+# (name varies — kaia.conf, klaytn.conf, and others have been seen — so this
+# only checks that at least one *.conf file exists there, not any specific
+# name). Some mainnet nodes instead configure everything directly inside the
+# main /etc/telegraf/telegraf.conf with no telegraf.d/ files at all. That
+# case isn't auto-installed (telegraf.conf is too central/unstructured a
+# file to safely script-edit) — see print_manual_instructions below.
+telegraf_d_has_conf() {
+    local f
+    for f in "${CONF_DIR}"/*.conf; do
+        [ -f "$f" ] && return 0
+    done
+    return 1
+}
+
+# ── The input+output TOML block this script installs, shared by the
+# automatic file-write path and the manual-instructions path below. ─────────
+render_kaia_log_conf() {
+    local log_file="$1"
+    cat << EOF
+[[inputs.tail]]
+  files = ["${log_file}"]
+  from_beginning = false
+  watch_method = "inotify"
+  name_override = "kaia_log"
+  data_format = "value"
+  data_type = "string"
+
+[[outputs.influxdb]]
+  urls = ["${INFLUX_URL}"]
+  database = "${INFLUX_DB}"
+  namepass = ["kaia_log"]
+EOF
+}
+
+print_manual_instructions() {
+    local log_file="$1"
+    echo
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    warn "No *.conf files found under ${CONF_DIR}/ — this node appears to"
+    warn "configure telegraf directly in /etc/telegraf/telegraf.conf instead"
+    warn "of ${CONF_DIR}/. Automatic install skipped (won't script-edit telegraf.conf)."
+    echo
+    echo "  Add the block below to /etc/telegraf/telegraf.conf, then also add"
+    echo "    namedrop = [\"kaia_log\"]"
+    echo "  to your EXISTING [[outputs.influxdb]] block (the one sending"
+    echo "  metrics) so it doesn't also receive this data. Then:"
+    echo "    systemctl reload telegraf"
+    echo
+    render_kaia_log_conf "$log_file"
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+}
+
 # ── Prevent kaia_log from also flowing into the existing metrics DB ─────────
-# Existing kaia.conf/klaytn.conf has its own [[outputs.influxdb]] (procstat/
-# prometheus -> kairos/mainnet metrics DB). Telegraf sends every input's
-# metrics to every output unless filtered, so without a namedrop there the
-# new kaia_log data would also land in the metrics DB. Patch it in-place
-# (only the first [[outputs.influxdb]] block found; idempotent).
+# Telegraf sends every input's metrics to every output unless filtered, so
+# without a namedrop there the new kaia_log data would also land in the
+# metrics DB. Patch it in-place (only the first real block found; idempotent).
+# telegraf.conf ships with a huge block of commented-out "# [[outputs.
+# influxdb]] ..." documentation/examples, so matching below is anchored to
+# the start of the line (optional leading whitespace only) — a "#"-prefixed
+# example is never mistaken for a real block.
 patch_metrics_output() {
-    local target=""
-    for f in /etc/telegraf/telegraf.d/kaia.conf /etc/telegraf/telegraf.d/klaytn.conf; do
-        [ -f "$f" ] && { target="$f"; break; }
+    local target="" f
+    for f in "${CONF_DIR}"/*.conf; do
+        [ -f "$f" ] || continue
+        [ "$f" = "$CONF_FILE" ] && continue  # skip our own kaia_log.conf
+        grep -qE '^[[:space:]]*\[\[outputs\.influxdb\]\]' "$f" && { target="$f"; break; }
     done
     if [ -z "$target" ]; then
-        warn "kaia.conf/klaytn.conf not found — skip metrics-output patch"
-        return
-    fi
-    if ! grep -q '\[\[outputs\.influxdb\]\]' "$target"; then
-        warn "$target has no [[outputs.influxdb]] block — skip patch"
+        warn "No active [[outputs.influxdb]] block found among ${CONF_DIR}/*.conf — skip metrics-output patch"
         return
     fi
     if awk '
-        /\[\[outputs\.influxdb\]\]/ { in_block=1; next }
+        /^[ \t]*\[\[outputs\.influxdb\]\]/ { in_block=1; next }
         in_block && /^[ \t]*\[/ { in_block=0 }
         in_block && /^[ \t]*namedrop[ \t]*=/ && /kaia_log/ { found=1 }
         END { exit !found }
@@ -92,7 +147,7 @@ patch_metrics_output() {
     backup="${target}.bak.$(date +%Y%m%d%H%M%S)"
     awk '
         BEGIN { in_block=0; patched=0 }
-        /\[\[outputs\.influxdb\]\]/ { in_block=1; print; next }
+        /^[ \t]*\[\[outputs\.influxdb\]\]/ { in_block=1; print; next }
         in_block && /^[ \t]*\[/ {
             if (!patched) print "  namedrop = [\"kaia_log\"]"
             in_block=0
@@ -148,21 +203,12 @@ main() {
     echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
     echo
 
-    cat > "$CONF_FILE" << EOF
-[[inputs.tail]]
-  files = ["${log_file}"]
-  from_beginning = false
-  watch_method = "inotify"
-  name_override = "kaia_log"
-  data_format = "value"
-  data_type = "string"
+    if ! telegraf_d_has_conf; then
+        print_manual_instructions "$log_file"
+        exit 1
+    fi
 
-[[outputs.influxdb]]
-  urls = ["${INFLUX_URL}"]
-  database = "${INFLUX_DB}"
-  namepass = ["kaia_log"]
-EOF
-
+    render_kaia_log_conf "$log_file" > "$CONF_FILE"
     info "Config written: $CONF_FILE"
 
     patch_metrics_output
