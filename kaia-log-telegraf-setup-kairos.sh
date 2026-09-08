@@ -83,6 +83,7 @@ render_kaia_log_conf() {
 [[inputs.tail]]
   files = ["${log_file}"]
   from_beginning = false
+  initial_read_offset = "end"
   watch_method = "inotify"
   name_override = "kaia_log"
   data_format = "value"
