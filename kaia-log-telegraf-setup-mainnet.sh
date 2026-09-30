@@ -175,6 +175,63 @@ patch_metrics_output() {
     info "Patched $target: added namedrop=[\"kaia_log\"] to existing [[outputs.influxdb]] (backup: $backup)"
 }
 
+# ── Drop the redundant `instance` global tag, add `network` ─────────────────
+# `instance` under [global_tags] just repeats what [agent] hostname already
+# puts on every series as the `host` tag — a second, always-identical tag that
+# only adds cardinality. `network` is what the Grafana migration's routing and
+# keep-lists key on instead (kairos nodes got this same fix applied by hand;
+# see the grafana-migration project notes). Neither script here writes
+# kaia.conf/klaytn.conf — this only patches an existing one, so a node with
+# neither file (or with [global_tags] embedded in telegraf.conf directly, the
+# same case telegraf_d_has_conf/print_manual_instructions cover above) is left
+# alone rather than guessed at.
+#
+# Skips cleanly, not an error, when: neither file exists; a `network` tag is
+# already set (so re-running this script twice is a no-op, not a double add);
+# or the file has no `instance` line to begin with (nothing to replace).
+fix_global_tags() {
+    local candidates=("${CONF_DIR}/kaia.conf" "${CONF_DIR}/klaytn.conf")
+    local target="" f
+    for f in "${candidates[@]}"; do
+        [ -f "$f" ] && { target="$f"; break; }
+    done
+    if [ -z "$target" ]; then
+        warn "Neither kaia.conf nor klaytn.conf found under ${CONF_DIR}/ — skip instance/network tag fix"
+        return
+    fi
+    if grep -qE '^[[:space:]]*network[[:space:]]*=' "$target"; then
+        info "$target already has a network tag — skip instance/network tag fix"
+        return
+    fi
+    if ! grep -qE '^[[:space:]]*instance[[:space:]]*=' "$target"; then
+        warn "$target has no 'instance' tag under [global_tags] — skip (nothing to replace)"
+        return
+    fi
+
+    local tmp backup
+    tmp=$(mktemp)
+    backup="${target}.bak.$(date +%Y%m%d%H%M%S)"
+    awk -v net="$NETWORK" '
+        /^[[:space:]]*instance[[:space:]]*=/ && $0 !~ /^[[:space:]]*#/ {
+            match($0, /^[[:space:]]*/)
+            indent = substr($0, RSTART, RLENGTH)
+            line = $0
+            sub(/^[[:space:]]*/, "", line)
+            print indent "# " line
+            print indent "network = \"" net "\""
+            next
+        }
+        { print }
+    ' "$target" > "$tmp"
+
+    cp "$target" "$backup"
+    # cp (not mv/rename) so $target keeps its original mode/owner/SELinux
+    # context, same reasoning as patch_metrics_output above.
+    cp "$tmp" "$target"
+    rm -f "$tmp"
+    info "Patched $target: commented out instance tag, added network = \"$NETWORK\" (backup: $backup)"
+}
+
 main() {
     echo "============================================================"
     echo "  Kaia CN Telegraf Log Config Setup [MAINNET]"
@@ -213,6 +270,7 @@ main() {
     info "Config written: $CONF_FILE"
 
     patch_metrics_output
+    fix_global_tags
 
     if systemctl is-active telegraf >/dev/null 2>&1; then
         systemctl reload telegraf \
