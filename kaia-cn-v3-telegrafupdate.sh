@@ -15,7 +15,7 @@ CONF_DIR="/etc/telegraf/telegraf.d"
 TELEGRAF_CONF="/etc/telegraf/telegraf.conf"
 NODETYPE="cn"
 NETWORK="mainnet"
-INFLUX_URL="${INFLUX_URL:-http://metrics.node.kaia.io:8429}"
+INFLUX_URL="${INFLUX_URL:-http://metrics.node.kaia.io:45560}"
 INFLUX_DB="${INFLUX_DB:-kaia-network-monitoring}"
 DEFAULT_EXE="kcn"
 FLUENTBIT_INSTALL_URL="${FLUENTBIT_INSTALL_URL:-https://raw.githubusercontent.com/fluent/fluent-bit/master/install.sh}"
@@ -26,9 +26,12 @@ PREFLIGHT_SCRIPT="/usr/local/bin/kaia-log-shipper-preflight.sh"
 LOG_SHIPPER_UNIT="/etc/systemd/system/kaia-log-shipper.service"
 # vlogs-external LoadBalancer (kaia-grafana namespace, kaia-cluster-prod) —
 # same VictoriaLogs ingest endpoint the kairos fleet's kaia-log-shipper units
-# already point at.
-LOG_INGEST_HOST="${LOG_INGEST_HOST:-35.216.50.236}"
-LOG_INGEST_PORT="${LOG_INGEST_PORT:-9428}"
+# already point at. Port 45560 is shared with the metrics endpoint above by
+# deliberate choice (both external Services' own upstream components still
+# listen internally on their old default ports, 8429/9428 — only the
+# external-facing port was unified), not a coincidence to preserve.
+LOG_INGEST_HOST="${LOG_INGEST_HOST:-logs.node.kaia.io}"
+LOG_INGEST_PORT="${LOG_INGEST_PORT:-45560}"
 
 info() { printf '\033[0;32m[INFO]\033[0m  %s\n' "$*"; }
 warn() { printf '\033[0;33m[WARN]\033[0m  %s\n' "$*"; }
@@ -309,7 +312,7 @@ render_log_conf() {
     host                      ${LOG_INGEST_HOST}
     port                      ${LOG_INGEST_PORT}
     # No TLS — a deliberate carry-over, same as the metrics path beside it
-    # (vmagent-external :8429): plain HTTP reachable only from an IP
+    # (metrics.node.kaia.io:45560): plain HTTP reachable only from an IP
     # allowlist. Node logs are block numbers/hashes/peer counts, not
     # secrets, but raising this whole ingest surface to TLS is tracked as a
     # separate, not-yet-done item.
