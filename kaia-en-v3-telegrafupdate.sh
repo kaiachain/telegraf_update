@@ -98,8 +98,14 @@ migrate_node_conf() {
 
     info "Found existing conf: ${target}"
 
-    if grep -qE '^[[:space:]]*network[[:space:]]*=' "$target"; then
-        info "${target} already has a network tag — already migrated, skip."
+    # A bare `network =` tag is not proof of a v3 migration on its own: some
+    # EN nodes already carry nodetype/network global tags from an earlier,
+    # partial reorg while their [[outputs.influxdb]] still points at the old
+    # node.kaia.io InfluxDB. The only thing that actually means "this file
+    # already writes to the v3 target" is the v3 database name appearing in
+    # it; check that instead of the tag.
+    if grep -qF "database = \"${INFLUX_DB}\"" "$target"; then
+        info "${target} already targets ${INFLUX_DB} — already migrated, skip."
         return
     fi
 
