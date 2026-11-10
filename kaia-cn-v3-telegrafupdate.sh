@@ -4,8 +4,8 @@
 # Run on a Mainnet CN node — migrates telegraf.d/{kaia,klaytn}.conf to the v3
 # format (fixed nodetype/network global tags, new metrics InfluxDB target),
 # tunes telegraf.conf's [agent] collection intervals, and installs Fluent Bit
-# as the node's log shipper (the package's stock fluent-bit.service, reading
-# /etc/fluent-bit/fluent-bit.conf).
+# as the node's log shipper (the package's stock fluent-bit.service, whose
+# /etc/fluent-bit/fluent-bit.conf only @INCLUDEs /etc/fluent-bit/kaia-logs.conf).
 #
 # Usage:
 #   curl -sSL https://raw.githubusercontent.com/kaiachain/telegraf_update/main/kaia-cn-v3-telegrafupdate.sh | sudo bash
@@ -23,23 +23,25 @@ DEFAULT_EXE="kcn"
 FLUENTBIT_INSTALL_URL="${FLUENTBIT_INSTALL_URL:-https://raw.githubusercontent.com/fluent/fluent-bit/master/install.sh}"
 FLUENTBIT_BIN="/opt/fluent-bit/bin/fluent-bit"
 FLUENTBIT_CONF_DIR="/etc/fluent-bit"
-# The package's own fluent-bit.service reads this file; the log shipping
-# config replaces the stock demo config in it.
-LOG_CONF="${FLUENTBIT_CONF_DIR}/fluent-bit.conf"
+# The package's own fluent-bit.service always reads fluent-bit.conf
+# (hardcoded -c in its unit). Its stock demo content is replaced by a single
+# @INCLUDE of kaia-logs.conf, which holds the actual log shipping config.
+FLUENTBIT_MAIN_CONF="${FLUENTBIT_CONF_DIR}/fluent-bit.conf"
+LOG_CONF="${FLUENTBIT_CONF_DIR}/kaia-logs.conf"
 FLUENTBIT_SERVICE="fluent-bit"
 FLUENTBIT_STORAGE_DIR="/var/lib/fluent-bit"
-# Marker written into LOG_CONF, so a re-run can tell our config from the
+# Marker written into both files, so a re-run can tell our config from the
 # stock demo config.
 LOG_CONF_MARKER="managed by kaia-cn-v3-telegrafupdate.sh"
 # Older revisions of this script shipped logs with a dedicated
-# kaia-log-shipper.service (its own unit, preflight script and kaia-logs.conf).
-# A node that still has it is migrated to fluent-bit.service: the legacy unit
-# is stopped BEFORE fluent-bit.service starts (both running would ship every
-# line twice), and its files are removed — kaia-logs.conf is kept as a backup.
+# kaia-log-shipper.service (its own unit and preflight script, reading the
+# same kaia-logs.conf). A node that still has it is migrated to
+# fluent-bit.service: the legacy unit is stopped BEFORE fluent-bit.service
+# starts (both running would ship every line twice), and its unit and
+# preflight script are removed. kaia-logs.conf stays where it is.
 LEGACY_LOG_SHIPPER_SERVICE="kaia-log-shipper"
 LEGACY_LOG_SHIPPER_UNIT="/etc/systemd/system/kaia-log-shipper.service"
 LEGACY_PREFLIGHT_SCRIPT="/usr/local/bin/kaia-log-shipper-preflight.sh"
-LEGACY_LOG_CONF="${FLUENTBIT_CONF_DIR}/kaia-logs.conf"
 # vlogs-external LoadBalancer (kaia-grafana namespace, kaia-cluster-prod) —
 # same VictoriaLogs ingest endpoint the kairos fleet's kaia-log-shipper units
 # already point at. Port 45560 is shared with the metrics endpoint above by
@@ -263,16 +265,17 @@ get_node_instance() {
     echo "${hostname_val:-$(uname -n)}"
 }
 
-# ── The fluent-bit.conf content, parameterized the same way render_conf is —
+# ── The kaia-logs.conf content, parameterized the same way render_conf is —
 # one render function shared by nothing else here since there's no preview
 # path (log shipping needs a real log file to point at, unlike the metrics
 # conf which can always be previewed). ──────────────────────────────────────
 render_log_conf() {
     local log_file="$1" instance="$2"
     cat << EOF
-# /etc/fluent-bit/fluent-bit.conf — ${LOG_CONF_MARKER}.
-# Read by the package's stock fluent-bit.service. Manual edits are
-# overwritten the next time this script runs.
+# /etc/fluent-bit/kaia-logs.conf — ${LOG_CONF_MARKER}.
+# @INCLUDEd by /etc/fluent-bit/fluent-bit.conf, which the package's stock
+# fluent-bit.service reads. Manual edits are overwritten the next time this
+# script runs.
 #
 # Ships this node's kcnd log to VictoriaLogs via Fluent Bit rather than
 # telegraf: telegraf's own InfluxDB output would exit entirely if a second,
@@ -346,13 +349,26 @@ render_log_conf() {
 EOF
 }
 
-# ── Read one "Key value" line from the legacy kaia-logs.conf (e.g. the
+# ── /etc/fluent-bit/fluent-bit.conf: nothing but an @INCLUDE of kaia-logs.conf.
+# Any stock demo [INPUT]/[OUTPUT] left in this file would run alongside the
+# real config, so the whole file is replaced. ──────────────────────────────
+render_main_conf() {
+    cat << EOF
+# /etc/fluent-bit/fluent-bit.conf — ${LOG_CONF_MARKER}.
+# Read by the package's stock fluent-bit.service (hardcoded -c in its unit).
+# The log shipping config lives in kaia-logs.conf; keep this file to the one
+# @INCLUDE line below.
+@INCLUDE ${LOG_CONF}
+EOF
+}
+
+# ── Read one "Key value" line from the existing kaia-logs.conf (e.g. the
 # tailed Path, or "Record instance <name>"), so a migrated node keeps the
 # exact same log file and log stream identity it already ships under. ─────
 legacy_conf_value() {
     local pattern="$1"
-    [ -f "$LEGACY_LOG_CONF" ] || return 0
-    sed -n "s/^[[:space:]]*${pattern}[[:space:]]\{1,\}//p" "$LEGACY_LOG_CONF" \
+    [ -f "$LOG_CONF" ] || return 0
+    sed -n "s/^[[:space:]]*${pattern}[[:space:]]\{1,\}//p" "$LOG_CONF" \
         | head -n1 | sed 's/[[:space:]]*$//'
 }
 
@@ -364,25 +380,24 @@ has_legacy_log_shipper() {
 # ── Stop and remove the legacy kaia-log-shipper.service. Called only after
 # the new fluent-bit.conf passed --dry-run, right before fluent-bit.service
 # starts, so the gap without log shipping is a few seconds and the two never
-# run at the same time. The tail offset DB (/var/lib/fluent-bit/tail.db) is
-# shared, so fluent-bit.service resumes where the legacy unit stopped. ─────
+# run at the same time. kaia-logs.conf and the tail offset DB
+# (/var/lib/fluent-bit/tail.db) are shared, so fluent-bit.service resumes
+# where the legacy unit stopped. ────────────────────────────────────────────
 remove_legacy_log_shipper() {
     systemctl disable --now "$LEGACY_LOG_SHIPPER_SERVICE" > /dev/null 2>&1 || true
     rm -f "$LEGACY_LOG_SHIPPER_UNIT" "$LEGACY_PREFLIGHT_SCRIPT"
-    if [ -f "$LEGACY_LOG_CONF" ]; then
-        mv "$LEGACY_LOG_CONF" "${LEGACY_LOG_CONF}.bak.$(date +%Y%m%d%H%M%S)"
-    fi
     systemctl daemon-reload
     systemctl reset-failed "$LEGACY_LOG_SHIPPER_SERVICE" > /dev/null 2>&1 || true
-    info "Removed legacy ${LEGACY_LOG_SHIPPER_SERVICE}.service (unit, preflight script; kaia-logs.conf kept as .bak)"
+    info "Removed legacy ${LEGACY_LOG_SHIPPER_SERVICE}.service (unit and preflight script)"
 }
 
 # ── Point the package's stock fluent-bit.service at this node's kcnd log:
-# replace /etc/fluent-bit/fluent-bit.conf (previous file backed up), validate
-# it with --dry-run, migrate away from the legacy kaia-log-shipper.service if
-# present, then enable and restart fluent-bit.service. Skips when
-# fluent-bit.service is already running this script's config and no legacy
-# unit is left, so a good existing install is never touched. ───────────────
+# write kaia-logs.conf and a fluent-bit.conf that only @INCLUDEs it (previous
+# files backed up), validate with --dry-run, migrate away from the legacy
+# kaia-log-shipper.service if present, then enable and restart
+# fluent-bit.service. Skips when fluent-bit.service is already running this
+# script's config and no legacy unit is left, so a good existing install is
+# never touched. ────────────────────────────────────────────────────────────
 install_log_shipper() {
     if [ ! -x "$FLUENTBIT_BIN" ]; then
         warn "${FLUENTBIT_BIN} not found — Fluent Bit install must have failed, skip log shipper setup."
@@ -394,13 +409,13 @@ install_log_shipper() {
 
     if [ "$legacy" -eq 0 ] \
         && systemctl is-active "$FLUENTBIT_SERVICE" > /dev/null 2>&1 \
-        && grep -qF "$LOG_CONF_MARKER" "$LOG_CONF" 2> /dev/null; then
+        && grep -qF "$LOG_CONF_MARKER" "$FLUENTBIT_MAIN_CONF" 2> /dev/null; then
         info "${FLUENTBIT_SERVICE} already active with this script's config — skip log shipper setup."
         return
     fi
 
     detect_kaia_log_file
-    if [ -z "$LOG_FILE" ] && [ "$legacy" -eq 1 ]; then
+    if [ -z "$LOG_FILE" ]; then
         LOG_FILE="$(legacy_conf_value Path)"
     fi
     if [ -z "$LOG_FILE" ]; then
@@ -412,33 +427,40 @@ install_log_shipper() {
         return
     fi
 
-    # Keep the instance a migrated node already ships under; otherwise use
-    # the telegraf hostname, same as the metrics side.
-    local instance="" backup=""
-    if [ "$legacy" -eq 1 ]; then
-        instance="$(legacy_conf_value 'Record[[:space:]]\{1,\}instance')"
-    fi
+    # Keep the instance an existing kaia-logs.conf already ships under (a
+    # migrated node keeps its log stream); otherwise use the telegraf
+    # hostname, same as the metrics side.
+    local instance ts main_backup="" log_backup=""
+    instance="$(legacy_conf_value 'Record[[:space:]]\{1,\}instance')"
     [ -n "$instance" ] || instance="$(get_node_instance)"
 
+    ts="$(date +%Y%m%d%H%M%S)"
     mkdir -p "$FLUENTBIT_CONF_DIR" "$FLUENTBIT_STORAGE_DIR"
+    if [ -f "$FLUENTBIT_MAIN_CONF" ]; then
+        main_backup="${FLUENTBIT_MAIN_CONF}.bak.${ts}"
+        cp -p "$FLUENTBIT_MAIN_CONF" "$main_backup"
+    fi
     if [ -f "$LOG_CONF" ]; then
-        backup="${LOG_CONF}.bak.$(date +%Y%m%d%H%M%S)"
-        cp -p "$LOG_CONF" "$backup"
+        log_backup="${LOG_CONF}.bak.${ts}"
+        cp -p "$LOG_CONF" "$log_backup"
     fi
 
     render_log_conf "$LOG_FILE" "$instance" > "$LOG_CONF"
-    chmod 644 "$LOG_CONF"
+    render_main_conf > "$FLUENTBIT_MAIN_CONF"
+    chmod 644 "$LOG_CONF" "$FLUENTBIT_MAIN_CONF"
 
-    # Fluent Bit's own parser, so a malformed config is caught here instead of
-    # in a restart loop. On failure the previous file is put back and the
-    # legacy unit (if any) is left running untouched.
-    if ! "$FLUENTBIT_BIN" --dry-run -c "$LOG_CONF" > /dev/null 2>&1; then
-        warn "${LOG_CONF} failed fluent-bit --dry-run — restoring the previous file, skip log shipper setup."
-        if [ -n "$backup" ]; then cp -p "$backup" "$LOG_CONF"; fi
+    # Fluent Bit's own parser on the file the service actually loads, so a
+    # malformed config (or a broken @INCLUDE) is caught here instead of in a
+    # restart loop. On failure the previous files are put back and the legacy
+    # unit (if any) is left running untouched.
+    if ! "$FLUENTBIT_BIN" --dry-run -c "$FLUENTBIT_MAIN_CONF" > /dev/null 2>&1; then
+        warn "${FLUENTBIT_MAIN_CONF} failed fluent-bit --dry-run — restoring the previous files, skip log shipper setup."
+        if [ -n "$main_backup" ]; then cp -p "$main_backup" "$FLUENTBIT_MAIN_CONF"; else rm -f "$FLUENTBIT_MAIN_CONF"; fi
+        if [ -n "$log_backup" ]; then cp -p "$log_backup" "$LOG_CONF"; else rm -f "$LOG_CONF"; fi
         return
     fi
 
-    info "Log shipper configured (conf=${LOG_CONF}, log_file=${LOG_FILE}, instance=${instance}, destination=${LOG_INGEST_HOST}:${LOG_INGEST_PORT}${backup:+, backup: ${backup}})"
+    info "Log shipper configured (conf=${LOG_CONF} via ${FLUENTBIT_MAIN_CONF}, log_file=${LOG_FILE}, instance=${instance}, destination=${LOG_INGEST_HOST}:${LOG_INGEST_PORT})"
 
     if [ "$legacy" -eq 1 ]; then
         remove_legacy_log_shipper
